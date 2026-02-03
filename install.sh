@@ -171,7 +171,7 @@ elif [[ "$not_rebuild" == [nN] ]]; then
     echo -e "$yellow自己编译NaïveProxy的Caddy$none"
     echo "----------------------------------------------------------------"
     cd /tmp
-    bash <( curl -L https://github.com/crazypeace/naive/raw/main/buildcaddy.sh)
+    bash <( curl -L https://raw.githubusercontent.com/viryaka/install_naive_l4/refs/heads/main/buildcaddy.sh)
 else
     error
 fi
