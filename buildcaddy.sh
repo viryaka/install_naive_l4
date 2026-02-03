@@ -46,7 +46,11 @@ go version
 
 # 编译 Caddy
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-~/go/bin/xcaddy build --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive
+~/go/bin/xcaddy build \
+    --with github.com/caddyserver/forwardproxy@caddy2=github.com/klzgrad/forwardproxy@naive \
+    --with github.com/mholt/caddy-l4@master \
+    --with github.com/caddy-dns/cloudflare
+
 ./caddy version
 
 cd ${save_dir}
