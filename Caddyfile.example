@@ -1,0 +1,116 @@
+{
+    # 全局配置，防止 L7 自动占用 80 端口
+    http_port 8080
+    order forward_proxy before reverse_proxy  # 代理优先级
+    
+    layer4 {
+        # HTTPS端口 (443)
+        :443 {
+            # 1. 匹配器定义在 route 外部
+            @local tls sni {domain} {domain} {domain} {domain} {domain} {domain}
+            
+            # 2. 路由逻辑
+            route @local {
+                proxy localhost:8443
+            }
+            
+            # 3. 默认路由
+            route {
+                proxy {Forward IP}:443
+            }
+        }
+        
+        # HTTP端口 (80)
+        :80 {
+            route {
+                proxy {Forward IP}:80
+            }
+        }
+    }
+}
+
+# ==========================================
+# 本地网站 1：Web 业务
+# ==========================================
+{domain}:8443 {
+    # 绑定到本地，防止外网直接访问此端口
+    bind 127.0.0.1
+    
+    # 这里不需要再写域名，直接配置 DNS 插件
+    tls {
+        dns cloudflare {key}
+    }
+    
+    reverse_proxy localhost:3456
+}
+
+{domain}:8443 {
+    # 绑定到本地，防止外网直接访问此端口
+    bind 127.0.0.1
+    
+    # 这里不需要再写域名，直接配置 DNS 插件
+    tls {
+        dns cloudflare {key}
+    }
+    
+    reverse_proxy localhost:8317
+}
+
+{domain}:8443 {
+    # 绑定到本地，防止外网直接访问此端口
+    bind 127.0.0.1
+    
+    # 这里不需要再写域名，直接配置 DNS 插件
+    tls {
+        dns cloudflare {key}
+    }
+    
+    reverse_proxy localhost:8384
+}
+
+{domain}:8443 {
+    # 绑定到本地，防止外网直接访问此端口
+    bind 127.0.0.1
+    
+    # 这里不需要再写域名，直接配置 DNS 插件
+    tls {
+        dns cloudflare {key}
+    }
+    
+    reverse_proxy localhost:3001
+}
+
+{domain}:8443 {
+    # 绑定到本地，防止外网直接访问此端口
+    bind 127.0.0.1
+    
+    # 这里不需要再写域名，直接配置 DNS 插件
+    tls {
+        dns cloudflare {key}
+    }
+    
+    reverse_proxy localhost:5005
+}
+
+# ==========================================
+# 本地网站 2：NaiveProxy
+# ==========================================
+# 添加 :8443 兜底
+:8443, {local proxy domain}:8443 {
+    bind 127.0.0.1  # Layer 4 转发过来的流量，这里用 127.0.0.1 是对的
+    
+    tls {
+        dns cloudflare {key}
+    }
+
+    forward_proxy {
+        basic_auth {username} {password}
+        hide_ip
+        hide_via
+        probe_resistance
+    }
+
+    reverse_proxy {reverse_domain} {
+        header_up Host {upstream_hostport}
+    }
+}
