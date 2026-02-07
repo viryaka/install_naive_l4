@@ -3,7 +3,7 @@
 
 原脚本地址： https://github.com/crazypeace/naive/
 
-# 以下为原脚本说明
+# 脚本说明
 这个一键脚本超级简单。有效语句10行(其中安装Caddy 5行, 下载NaïveProxy作者编译的Caddy 1行, 解压 1行, 停止Caddy 1行, 替换Caddy程序 1行, 启动Caddy 1行)+Caddy配置文件15行(其中你需要修改5处), 其它都是用来检验小白输入错误参数或者搭建条件不满足的。
 
 你如果不放心开源的脚本，你可以自己执行那10行有效语句，再修改配置文件中的5处，也能达到一样的效果。
@@ -14,7 +14,7 @@ apt update
 apt install -y curl
 ```
 ```
-bash <(curl -L https://github.com/crazypeace/naive/raw/main/install.sh)
+bash <(curl -L https://github.com/viryaka/install_naive_l4/raw/main/install.sh)
 ```
 
 脚本中很大部分都是在校验用户的输入。其实照着下面的步骤自己配置就行了。
