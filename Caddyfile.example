@@ -7,7 +7,7 @@
         # HTTPS端口 (443)
         :443 {
             # 1. 匹配器定义在 route 外部
-            @local tls sni {domain} {domain} {domain} {domain} {domain} {domain}
+            @local tls sni {local proxy domain} {domain1} {domain2} {domain3} {domain4} {domain5}
             
             # 2. 路由逻辑
             route @local {
@@ -32,7 +32,7 @@
 # ==========================================
 # 本地网站 1：Web 业务
 # ==========================================
-{domain}:8443 {
+{domain1}:8443 {
     # 绑定到本地，防止外网直接访问此端口
     bind 127.0.0.1
     
@@ -44,7 +44,7 @@
     reverse_proxy localhost:3456
 }
 
-{domain}:8443 {
+{domain2}:8443 {
     # 绑定到本地，防止外网直接访问此端口
     bind 127.0.0.1
     
@@ -56,7 +56,7 @@
     reverse_proxy localhost:8317
 }
 
-{domain}:8443 {
+{domain3}:8443 {
     # 绑定到本地，防止外网直接访问此端口
     bind 127.0.0.1
     
@@ -68,7 +68,7 @@
     reverse_proxy localhost:8384
 }
 
-{domain}:8443 {
+{domain4}:8443 {
     # 绑定到本地，防止外网直接访问此端口
     bind 127.0.0.1
     
@@ -80,7 +80,7 @@
     reverse_proxy localhost:3001
 }
 
-{domain}:8443 {
+{domain5}:8443 {
     # 绑定到本地，防止外网直接访问此端口
     bind 127.0.0.1
     
