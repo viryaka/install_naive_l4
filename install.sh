@@ -735,7 +735,7 @@ menu_update_caddy() {
   fi
   restart_caddy
 }
-}
+
 menu_loop() {
   while :; do
     echo "-----------------------------"
