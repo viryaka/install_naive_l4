@@ -78,3 +78,6 @@
 - Caddy 版本来源描述是否完整（预编译 fallback、自编译插件与 Go 覆盖提示）。
 - 依赖/权限假设未被删除或弱化。
 
+## Claude 使用规则补充
+- Read 工具在本环境下若传空字符串会触发 `Invalid pages parameter`；读取非 PDF 时需显式传 `pages: "1-1"` 以避免空值报错。
+

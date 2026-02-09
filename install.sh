@@ -140,14 +140,17 @@ prompt_ip() {
 
 prompt_yes_no() {
   local prompt="$1" default_ans="$2" timeout="${3:-0}" ans
+  # 规范默认提示：默认是 Y 则 "Y/n"，默认是 N 则 "y/N"
+  local suffix_default="Y/n"
+  [[ "${default_ans}" == "N" ]] && suffix_default="y/N"
   while :; do
     if [[ "${timeout}" -gt 0 ]]; then
-      if ! read -rt "${timeout}" -rp "${prompt} (Y/n, 默认${default_ans}, ${timeout}s 超时默认): " ans; then
+      if ! read -rt "${timeout}" -rp "${prompt} (${suffix_default}, 默认${default_ans}, ${timeout}s 超时默认): " ans; then
         ans="${default_ans}"
         echo
       fi
     else
-      read -rp "${prompt} (Y/n, 默认${default_ans}): " ans
+      read -rp "${prompt} (${suffix_default}, 默认${default_ans}): " ans
     fi
     [[ -z "${ans}" ]] && ans="${default_ans}"
     case "$ans" in
@@ -184,45 +187,101 @@ add_caddy_repo() {
 }
 
 download_prebuilt() {
-  local tag url
+  local tag url dl_log
   tag=$(curl -s https://api.github.com/repos/klzgrad/forwardproxy/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v2.10.0-naive")
   url="https://github.com/klzgrad/forwardproxy/releases/download/${tag}/caddy-forwardproxy-naive.tar.xz"
-  _yellow "下载预编译Caddy (${tag})"
+  dl_log=$(mktemp)
+  _yellow "下载预编译Caddy (${tag}) -> ${url}"
   cd /tmp
   rm -rf caddy-forwardproxy-naive caddy-forwardproxy-naive.tar.xz
-  if ! wget "${url}"; then
+  if ! wget "${url}" >"${dl_log}" 2>&1; then
     _red "下载失败，使用回退版本 v2.10.0-naive"
     url="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
-    wget "${url}"
+    if ! wget "${url}" >"${dl_log}" 2>&1; then
+      _red "回退版本下载仍失败，日志如下："
+      cat "${dl_log}" >&2
+      rm -f "${dl_log}"
+      return 1
+    fi
   fi
-  tar -xf caddy-forwardproxy-naive.tar.xz
+  if ! tar -xf caddy-forwardproxy-naive.tar.xz >"${dl_log}" 2>&1; then
+    _red "解压预编译包失败，日志如下："
+    cat "${dl_log}" >&2
+    rm -f "${dl_log}"
+    return 1
+  fi
+  rm -f "${dl_log}"
   cd caddy-forwardproxy-naive
 }
 
 build_caddy() {
   _yellow "调用 buildcaddy.sh 编译 Caddy"
   cd /tmp
-  bash <( curl -L https://raw.githubusercontent.com/viryaka/install_naive_l4/refs/heads/main/buildcaddy.sh )
+  if ! bash <( curl -L https://raw.githubusercontent.com/viryaka/install_naive_l4/refs/heads/main/buildcaddy.sh ); then
+    _red "buildcaddy.sh 执行失败（自编译 Caddy 失败）"
+    return 1
+  fi
 }
 
 replace_caddy_bin() {
-  service caddy stop || true
-  cp /tmp/caddy /usr/bin/
+  local cp_log
+  cp_log=$(mktemp)
+  if ! service caddy stop >"${cp_log}" 2>&1; then
+    _yellow "service caddy stop 出现警告（可忽略继续）："
+    cat "${cp_log}" >&2
+  fi
+  if ! cp /tmp/caddy /usr/bin/ >"${cp_log}" 2>&1; then
+    _red "复制 /tmp/caddy 到 /usr/bin/ 失败，日志如下："
+    cat "${cp_log}" >&2
+    rm -f "${cp_log}"
+    return 1
+  fi
+  rm -f "${cp_log}"
 }
 
 install_or_update_caddy() {
   local source="$1"
+
+  # 若已存在 caddy，默认复用，除非用户选择重新安装
+  if command -v caddy >/dev/null 2>&1; then
+    local reuse
+    read -rp "检测到已有 caddy: $(command -v caddy) 是否复用当前 caddy? (Y/n, 默认Y): " reuse
+    [[ -z "${reuse}" ]] && reuse="Y"
+    case "${reuse}" in
+      [yY])
+        _yellow "复用当前 caddy，跳过重新安装/替换"
+        return
+        ;;
+      [nN])
+        _yellow "用户选择重新安装/替换 caddy"
+        ;;
+      *)
+        _yellow "输入无效，默认复用当前 caddy"
+        return
+        ;;
+    esac
+  fi
+
   if [[ $(cfg_get '.transit.enabled') == "true" && "${source}" == "prebuilt" ]]; then
     _yellow "中转启用时预编译 Caddy 不含 caddy-l4，自动改为自编译"
     source="build"
   fi
   add_caddy_repo
   if [[ "${source}" == "prebuilt" ]]; then
-    download_prebuilt
+    if ! download_prebuilt; then
+      _red "下载预编译 Caddy 失败，更新中止"
+      return 1
+    fi
   else
-    build_caddy
+    if ! build_caddy; then
+      _red "自编译 Caddy 失败，更新中止"
+      return 1
+    fi
   fi
-  replace_caddy_bin
+  if ! replace_caddy_bin; then
+    _red "替换 caddy 二进制失败，更新中止"
+    return 1
+  fi
 }
 
 # ===============================
@@ -380,11 +439,26 @@ generate_caddyfile() {
   fi
 
   if command -v caddy >/dev/null 2>&1; then
-    if ! caddy validate --config "${tmp_final}" >/dev/null 2>&1; then
-      _red "caddy validate 失败，保留原配置"
-      rm -f "${tmp_block}" "${tmp_clean}" "${tmp_final}"
+    local validate_log
+    validate_log=$(mktemp)
+    if ! caddy validate --config "${tmp_final}" >"${validate_log}" 2>&1; then
+      local failed_copy="/etc/caddy/Caddyfile.failed_$(date +%Y%m%d_%H%M%S)"
+      local cp_err=""
+      if ! cp "${tmp_final}" "${failed_copy}" 2>"${validate_log}.cp"; then
+        cp_err=$(cat "${validate_log}.cp" 2>/dev/null || true)
+      fi
+      _red "caddy validate 失败，原配置未改动"
+      _yellow "validate 输出 (临时文件 ${validate_log}):"
+      cat "${validate_log}" >&2
+      if [[ -n "${cp_err}" ]]; then
+        _red "保存失败文件到 ${failed_copy} 失败: ${cp_err}"
+      else
+        _green "失败文件已保存: ${failed_copy}"
+      fi
+      rm -f "${tmp_block}" "${tmp_clean}" "${tmp_final}" "${validate_log}" "${validate_log}.cp"
       return 1
     fi
+    rm -f "${validate_log}" "${validate_log}.cp"
   fi
 
   if [[ -f "${CADDYFILE}" && "${backup_done}" == "false" ]]; then
@@ -655,10 +729,13 @@ menu_update_caddy() {
   fi
   cfg_set ".caddy_source=\"${source}\""
   save_config
-  install_or_update_caddy "${source}"
+  if ! install_or_update_caddy "${source}"; then
+    _red "更新 Caddy 失败（见上方日志）"
+    return 1
+  fi
   restart_caddy
 }
-
+}
 menu_loop() {
   while :; do
     echo "-----------------------------"
