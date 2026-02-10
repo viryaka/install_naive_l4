@@ -354,21 +354,28 @@ generate_caddyfile() {
     [[ -n "$d" && "$d" != "null" ]] && sni_list+=" ${d}"
   done < <(echo "$config" | jq -c '.services[]?')
 
+  # 构建 SNI 正则，兼容 caddy-l4 inline 语法（block 不被支持）
+  local sni_regex=""
+  for domain in ${sni_list}; do
+    [[ -z "${domain}" ]] && continue
+    local escaped="${domain//./\\.}"
+    if [[ -z "${sni_regex}" ]]; then
+      sni_regex="^(${escaped}"
+    else
+      sni_regex="${sni_regex}|${escaped}"
+    fi
+  done
+  [[ -n "${sni_regex}" ]] && sni_regex="${sni_regex})"
+
   {
     echo "# _naive_config_begin_"
     echo "{"
     echo "  order forward_proxy first"
     echo "}"
 
-    if [[ "${transit_enabled}" == "true" ]]; then
+    if [[ "${transit_enabled}" == "true" && -n "${sni_regex}" ]]; then
       echo "layer4 :443 {"
-      echo "  @local {"
-      echo "    tls {"
-      for domain in ${sni_list}; do
-        [[ -n "${domain}" ]] && echo "      sni ${domain}"
-      done
-      echo "    }"
-      echo "  }"
+      echo "  @local tls sni_regexp ${sni_regex}"
       echo "  route @local {"
       echo "    proxy localhost:${naive_port}"
       echo "  }"
@@ -382,7 +389,7 @@ generate_caddyfile() {
       echo "  }"
       echo "}"
     fi
-
+}
     echo ":${naive_port}, ${naive_domain}:${naive_port} {"
     if [[ -n "${cf_key}" && "${cf_key}" != "null" ]]; then
       echo "  tls {"

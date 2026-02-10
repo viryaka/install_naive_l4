@@ -6,17 +6,8 @@
     layer4 {
         # HTTPS端口 (443)
         :443 {
-            # 1. 匹配器定义在 route 外部，使用 block 语法逐行声明 SNI
-            @local {
-                tls {
-                    sni {local proxy domain}
-                    sni {domain1}
-                    sni {domain2}
-                    sni {domain3}
-                    sni {domain4}
-                    sni {domain5}
-                }
-            }
+            # 1. 匹配器定义在 route 外部，使用 inline tls sni_regexp（当前 caddy-l4 不支持 block）
+            @local tls sni_regexp ^({local proxy domain}|{domain1}|{domain2}|{domain3}|{domain4}|{domain5})
 
             # 2. 路由逻辑
             route @local {
@@ -28,6 +19,25 @@
                 proxy {Forward IP}:443
             }
         }
+
+        # 如需更复杂匹配，可参考官方示例：
+        # @tls-regexp tls sni_regexp ^(one|two)\.example\.com$
+        # route @tls-regexp {
+        #     proxy {tls.regexp.1}.machine.local:443
+        # }
+        # @tls-any tls
+        # route @tls-any {
+        #     proxy {l4.tls.server_name}:443
+        # }
+
+        # HTTP端口 (80)
+        :80 {
+            route {
+                proxy {Forward IP}:80
+            }
+        }
+    }
+}
 
         # HTTP端口 (80)
         :80 {
