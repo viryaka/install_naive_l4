@@ -6,20 +6,29 @@
     layer4 {
         # HTTPS端口 (443)
         :443 {
-            # 1. 匹配器定义在 route 外部
-            @local tls sni {local proxy domain} {domain1} {domain2} {domain3} {domain4} {domain5}
-            
+            # 1. 匹配器定义在 route 外部，使用 block 语法逐行声明 SNI
+            @local {
+                tls {
+                    sni {local proxy domain}
+                    sni {domain1}
+                    sni {domain2}
+                    sni {domain3}
+                    sni {domain4}
+                    sni {domain5}
+                }
+            }
+
             # 2. 路由逻辑
             route @local {
                 proxy localhost:8443
             }
-            
+
             # 3. 默认路由
             route {
                 proxy {Forward IP}:443
             }
         }
-        
+
         # HTTP端口 (80)
         :80 {
             route {

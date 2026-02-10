@@ -362,7 +362,13 @@ generate_caddyfile() {
 
     if [[ "${transit_enabled}" == "true" ]]; then
       echo "layer4 :443 {"
-      echo "  @local tls sni ${sni_list}"
+      echo "  @local {"
+      echo "    tls {"
+      for domain in ${sni_list}; do
+        [[ -n "${domain}" ]] && echo "      sni ${domain}"
+      done
+      echo "    }"
+      echo "  }"
       echo "  route @local {"
       echo "    proxy localhost:${naive_port}"
       echo "  }"
