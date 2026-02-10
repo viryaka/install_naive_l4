@@ -441,7 +441,7 @@ generate_caddyfile() {
   if command -v caddy >/dev/null 2>&1; then
     local validate_log
     validate_log=$(mktemp)
-    if ! caddy validate --config "${tmp_final}" >"${validate_log}" 2>&1; then
+    if ! caddy validate --config "${tmp_final}" --adapter caddyfile >"${validate_log}" 2>&1; then
       local failed_copy="/etc/caddy/Caddyfile.failed_$(date +%Y%m%d_%H%M%S)"
       local cp_err=""
       if ! cp "${tmp_final}" "${failed_copy}" 2>"${validate_log}.cp"; then
