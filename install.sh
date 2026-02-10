@@ -438,7 +438,7 @@ generate_caddyfile() {
     echo "# _naive_config_end_"
   } > "${tmp_block}"
 
-  if [[ "${overwrite_all}" == "true" ]]; then
+  if [[ "${overwrite_all:-false}" == "true" ]]; then
     cat "${tmp_block}" > "${tmp_final}"
   else
     if [[ -f "${CADDYFILE}" ]]; then
@@ -472,7 +472,7 @@ generate_caddyfile() {
     rm -f "${validate_log}" "${validate_log}.cp"
   fi
 
-  if [[ -f "${CADDYFILE}" && "${backup_done}" == "false" ]]; then
+  if [[ -f "${CADDYFILE}" && "${backup_done:-false}" == "false" ]]; then
     cp "${CADDYFILE}" "/etc/caddy/Caddyfile.bak_$(date +%Y%m%d%H%M%S)"
   fi
   mv "${tmp_final}" "${CADDYFILE}"
