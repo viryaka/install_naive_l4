@@ -6,8 +6,8 @@
     layer4 {
         # HTTPS端口 (443)
         :443 {
-            # 1. 匹配器定义在 route 外部，使用 inline tls sni_regexp（当前 caddy-l4 不支持 block）
-            @local tls sni_regexp ^({local proxy domain}|{domain1}|{domain2}|{domain3}|{domain4}|{domain5})
+            # 1. 匹配器定义在 route 外部
+            @local tls sni {domain1} {domain2} {domain3} {domain4} {domain5})
 
             # 2. 路由逻辑
             route @local {
