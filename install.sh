@@ -306,12 +306,12 @@ generate_caddyfile() {
   transit_ip=$(cfg_get '.transit.forward_ip')
   transit_port=$(cfg_get '.transit.forward_port')
 
-  local tmp_block tmp_clean tmp_final
+  local tmp_block="" tmp_clean="" tmp_final=""
   local overwrite_all=false
   local backup_done=false
-  tmp_block=$(mktemp)
-  tmp_clean=$(mktemp)
-  tmp_final=$(mktemp)
+  tmp_block=$(mktemp) || { _red "mktemp 创建 tmp_block 失败"; return 1; }
+  tmp_clean=$(mktemp) || { _red "mktemp 创建 tmp_clean 失败"; rm -f "${tmp_block:-}"; return 1; }
+  tmp_final=$(mktemp) || { _red "mktemp 创建 tmp_final 失败"; rm -f "${tmp_block:-}" "${tmp_clean:-}"; return 1; }
 
   # 构建域名列表用于 SNI 本地匹配
   if [[ -f "${CADDYFILE}" ]]; then
@@ -389,7 +389,7 @@ generate_caddyfile() {
       echo "  }"
       echo "}"
     fi
-}
+
     echo ":${naive_port}, ${naive_domain}:${naive_port} {"
     if [[ -n "${cf_key}" && "${cf_key}" != "null" ]]; then
       echo "  tls {"
@@ -442,8 +442,10 @@ generate_caddyfile() {
     cat "${tmp_block}" > "${tmp_final}"
   else
     if [[ -f "${CADDYFILE}" ]]; then
+      [[ -n "${tmp_clean:-}" ]] || { _red "tmp_clean 未就绪"; return 1; }
       sed '/_naive_config_begin_/,/_naive_config_end_/d' "${CADDYFILE}" > "${tmp_clean}"
     else
+      [[ -n "${tmp_clean:-}" ]] || { _red "tmp_clean 未就绪"; return 1; }
       > "${tmp_clean}"
     fi
     cat "${tmp_block}" "${tmp_clean}" > "${tmp_final}"
@@ -476,7 +478,9 @@ generate_caddyfile() {
     cp "${CADDYFILE}" "/etc/caddy/Caddyfile.bak_$(date +%Y%m%d%H%M%S)"
   fi
   mv "${tmp_final}" "${CADDYFILE}"
-  rm -f "${tmp_block}" "${tmp_clean}"
+  [[ -n "${tmp_block:-}" ]] && rm -f "${tmp_block}"
+  [[ -n "${tmp_clean:-}" ]] && rm -f "${tmp_clean}"
+  [[ -n "${tmp_final:-}" ]] && rm -f "${tmp_final}"
   return 0
 }
 
