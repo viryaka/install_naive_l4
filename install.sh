@@ -18,6 +18,21 @@ _cyan() { echo -e "${cyan}$*${none}"; }
 error() { echo -e "\n${red}输入错误!${none}\n"; }
 pause() { read -rsp "$(echo -e "按 ${green}Enter 回车键${none} 继续....或按 ${red}Ctrl + C${none} 取消.")" -d $'\n'; echo; }
 
+run_with_context() {
+  local label="$1"
+  shift
+  local rc
+  set +e
+  "$@"
+  rc=$?
+  set -euo pipefail
+  if [[ ${rc} -ne 0 ]]; then
+    _red "${label} 失败"
+    return ${rc}
+  fi
+  return 0
+}
+
 # ===============================
 # 常量与默认配置
 # ===============================
@@ -34,8 +49,12 @@ DEFAULT_CONFIG='{
   "services": [],
   "caddy_source": "prebuilt"
 }'
+FALLBACK_FORWARDPROXY_TAG="v2.10.0-naive"
+DEFAULT_SELF_BUILT_VERSION="v2.10.0-naive"
 
 config="${DEFAULT_CONFIG}"
+# 确保 set -u 下有默认值，避免未赋值引用
+LAST_CADDY_MODULE_STATUS="未检测 (未运行 get_local_caddy_info)"
 
 # ===============================
 # 依赖检查
@@ -52,6 +71,17 @@ ensure_deps() {
 # ===============================
 # 配置读写
 # ===============================
+clean_users() {
+  config=$(echo "${config}" | jq '
+    .users |= (
+      [ .[]?
+        | {name: ((.name // "" ) | tostring | gsub("^\\s+|\\s+$"; "")), password: (.password // "")}
+        | select(.name != "")
+      ]
+    )
+  ')
+}
+
 load_config() {
   if [[ -f "${CONFIG_PATH}" ]]; then
     config=$(cat "${CONFIG_PATH}" 2>/dev/null || echo "${DEFAULT_CONFIG}")
@@ -60,13 +90,15 @@ load_config() {
     echo "${DEFAULT_CONFIG}" > "${CONFIG_PATH}"
     config="${DEFAULT_CONFIG}"
   fi
+  clean_users
 }
 
 save_config() {
   local tmp_file
+  clean_users
   tmp_file=$(mktemp)
   echo "${config}" | jq '.' > "${tmp_file}"
-  install -d -m 750 "$(dirname "${CONFIG_PATH}")"
+  install -d -m 755 "$(dirname "${CONFIG_PATH}")"
   install -m 600 "${tmp_file}" "${CONFIG_PATH}"
   chown root:root "${CONFIG_PATH}"
   rm -f "${tmp_file}"
@@ -94,6 +126,76 @@ ensure_transit_build_source() {
     return 0
   fi
   return 1
+}
+
+# ===============================
+# 版本获取与比对
+# ===============================
+fetch_latest_naive_tag() {
+  local tag
+  tag=$(curl -s https://api.github.com/repos/klzgrad/forwardproxy/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "${FALLBACK_FORWARDPROXY_TAG}")
+  if [[ -z "${tag}" || "${tag}" == "null" ]]; then
+    tag="${FALLBACK_FORWARDPROXY_TAG}"
+  fi
+  echo "${tag}"
+}
+
+get_local_caddy_info() {
+  local bin="$(command -v caddy || true)" version cfg_version modules has_forwardproxy has_l4
+  local module_status="未包含naive插件，未包含caddy-l4插件"
+  LAST_CADDY_MODULE_STATUS="${module_status}"
+
+  if [[ -z "${bin}" ]]; then
+    LAST_CADDY_MODULE_STATUS="${module_status}"
+    echo "未安装"
+    return
+  fi
+
+  version=$(caddy version 2>/dev/null | awk '{print $3}' || true)
+  cfg_version=$(cfg_get '.caddy_version')
+  if [[ -z "${version}" || "${version}" == "unknown" ]]; then
+    if [[ -n "${cfg_version}" && "${cfg_version}" != "null" ]]; then
+      version="${cfg_version}"
+    else
+      version="unknown"
+    fi
+  fi
+
+  modules=$(caddy list-modules 2>/dev/null || true)
+  if [[ -n "${modules}" ]]; then
+    if echo "${modules}" | grep -Eq 'forward[_-]?proxy|forwardproxy'; then
+      has_forwardproxy="yes"
+    else
+      has_forwardproxy="no"
+    fi
+    if echo "${modules}" | grep -Eq '(^|\.)layer4(\.|$)'; then
+      has_l4="yes"
+    else
+      has_l4="no"
+    fi
+  else
+    has_forwardproxy="unknown"
+    has_l4="unknown"
+  fi
+
+  if [[ "${has_forwardproxy}" == "yes" && "${has_l4}" == "yes" ]]; then
+    module_status="已包含naive和caddy-l4插件"
+  elif [[ "${has_forwardproxy}" == "yes" && "${has_l4}" == "no" ]]; then
+    module_status="已包含naive插件，未包含caddy-l4插件"
+  elif [[ "${has_forwardproxy}" == "no" && "${has_l4}" == "yes" ]]; then
+    module_status="已包含caddy-l4插件，未包含naive插件"
+  else
+    module_status="未包含naive插件，未包含caddy-l4插件"
+  fi
+
+  LAST_CADDY_MODULE_STATUS="${module_status}"
+  echo "${version} (naive: ${module_status})"
+  return 0
+}
+
+get_local_build_tag_hint() {
+  # 自编译若无法解析版本，可直接使用固定基线（本次按预编译 v2.10.0 作为自编译版本号）
+  echo "self-built (基于 ${DEFAULT_SELF_BUILT_VERSION}，含 forwardproxy@naive + caddy-l4)"
 }
 
 # ===============================
@@ -139,10 +241,11 @@ prompt_ip() {
 }
 
 prompt_yes_no() {
-  local prompt="$1" default_ans="$2" timeout="${3:-0}" ans
+  local prompt="$1" default_ans="$2" timeout="${3:-0}" newline_before="${4:-false}" ans
   # 规范默认提示：默认是 Y 则 "Y/n"，默认是 N 则 "y/N"
   local suffix_default="Y/n"
   [[ "${default_ans}" == "N" ]] && suffix_default="y/N"
+  [[ "${newline_before}" == "true" ]] && echo
   while :; do
     if [[ "${timeout}" -gt 0 ]]; then
       if ! read -rt "${timeout}" -rp "${prompt} (${suffix_default}, 默认${default_ans}, ${timeout}s 超时默认): " ans; then
@@ -179,32 +282,40 @@ prompt_user_pwd() {
 # Caddy 安装/更新
 # ===============================
 add_caddy_repo() {
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
-  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-  sudo apt-get update
-  sudo apt-get install -y caddy
+  if ! run_with_context "获取 Caddy GPG key" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes"; then
+    return 1
+  fi
+  if ! run_with_context "写入 Caddy 源 list" bash -c "curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null"; then
+    return 1
+  fi
+  if ! run_with_context "apt-get update" sudo apt-get update; then
+    return 1
+  fi
+  if ! run_with_context "apt-get install caddy" sudo apt-get install -y caddy; then
+    return 1
+  fi
   systemctl enable caddy
 }
 
 download_prebuilt() {
   local tag url dl_log
-  tag=$(curl -s https://api.github.com/repos/klzgrad/forwardproxy/releases/latest | jq -r '.tag_name' 2>/dev/null || echo "v2.10.0-naive")
+  tag=$(fetch_latest_naive_tag)
   url="https://github.com/klzgrad/forwardproxy/releases/download/${tag}/caddy-forwardproxy-naive.tar.xz"
   dl_log=$(mktemp)
   _yellow "下载预编译Caddy (${tag}) -> ${url}"
   cd /tmp
   rm -rf caddy-forwardproxy-naive caddy-forwardproxy-naive.tar.xz
-  if ! wget "${url}" >"${dl_log}" 2>&1; then
-    _red "下载失败，使用回退版本 v2.10.0-naive"
-    url="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
-    if ! wget "${url}" >"${dl_log}" 2>&1; then
+  if ! run_with_context "下载预编译包" wget "${url}" >"${dl_log}" 2>&1; then
+    _red "下载失败，使用回退版本 ${FALLBACK_FORWARDPROXY_TAG}"
+    url="https://github.com/klzgrad/forwardproxy/releases/download/${FALLBACK_FORWARDPROXY_TAG}/caddy-forwardproxy-naive.tar.xz"
+    if ! run_with_context "下载回退预编译包" wget "${url}" >"${dl_log}" 2>&1; then
       _red "回退版本下载仍失败，日志如下："
       cat "${dl_log}" >&2
       rm -f "${dl_log}"
       return 1
     fi
   fi
-  if ! tar -xf caddy-forwardproxy-naive.tar.xz >"${dl_log}" 2>&1; then
+  if ! run_with_context "解压预编译包" tar -xf caddy-forwardproxy-naive.tar.xz >"${dl_log}" 2>&1; then
     _red "解压预编译包失败，日志如下："
     cat "${dl_log}" >&2
     rm -f "${dl_log}"
@@ -217,7 +328,7 @@ download_prebuilt() {
 build_caddy() {
   _yellow "调用 buildcaddy.sh 编译 Caddy"
   cd /tmp
-  if ! bash <( curl -L https://raw.githubusercontent.com/viryaka/install_naive_l4/refs/heads/main/buildcaddy.sh ); then
+  if ! run_with_context "执行 buildcaddy.sh" bash -c "bash <( curl -L https://raw.githubusercontent.com/viryaka/install_naive_l4/refs/heads/main/buildcaddy.sh )"; then
     _red "buildcaddy.sh 执行失败（自编译 Caddy 失败）"
     return 1
   fi
@@ -226,11 +337,11 @@ build_caddy() {
 replace_caddy_bin() {
   local cp_log
   cp_log=$(mktemp)
-  if ! service caddy stop >"${cp_log}" 2>&1; then
+  if ! run_with_context "停止 caddy 服务" service caddy stop >"${cp_log}" 2>&1; then
     _yellow "service caddy stop 出现警告（可忽略继续）："
     cat "${cp_log}" >&2
   fi
-  if ! cp /tmp/caddy /usr/bin/ >"${cp_log}" 2>&1; then
+  if ! run_with_context "复制 caddy 二进制" cp /tmp/caddy /usr/bin/ >"${cp_log}" 2>&1; then
     _red "复制 /tmp/caddy 到 /usr/bin/ 失败，日志如下："
     cat "${cp_log}" >&2
     rm -f "${cp_log}"
@@ -242,31 +353,15 @@ replace_caddy_bin() {
 install_or_update_caddy() {
   local source="$1"
 
-  # 若已存在 caddy，默认复用，除非用户选择重新安装
-  if command -v caddy >/dev/null 2>&1; then
-    local reuse
-    read -rp "检测到已有 caddy: $(command -v caddy) 是否复用当前 caddy? (Y/n, 默认Y): " reuse
-    [[ -z "${reuse}" ]] && reuse="Y"
-    case "${reuse}" in
-      [yY])
-        _yellow "复用当前 caddy，跳过重新安装/替换"
-        return
-        ;;
-      [nN])
-        _yellow "用户选择重新安装/替换 caddy"
-        ;;
-      *)
-        _yellow "输入无效，默认复用当前 caddy"
-        return
-        ;;
-    esac
-  fi
-
+  # 中转强制自编译兜底
   if [[ $(cfg_get '.transit.enabled') == "true" && "${source}" == "prebuilt" ]]; then
     _yellow "中转启用时预编译 Caddy 不含 caddy-l4，自动改为自编译"
     source="build"
   fi
-  add_caddy_repo
+  if ! add_caddy_repo; then
+    _red "配置 Caddy 源失败，更新中止"
+    return 1
+  fi
   if [[ "${source}" == "prebuilt" ]]; then
     if ! download_prebuilt; then
       _red "下载预编译 Caddy 失败，更新中止"
@@ -346,51 +441,55 @@ generate_caddyfile() {
     fi
   fi
 
-  # 构建域名列表用于 SNI 本地匹配
-  local sni_list="${naive_domain}"
+  # 构建域名列表用于 SNI 本地匹配（列表语法）
+  local sni_list=""
+  if [[ -n "${naive_domain}" ]]; then
+    sni_list="${naive_domain}"
+  fi
   while IFS= read -r svc; do
     local d
     d=$(echo "$svc" | jq -r '.domain')
-    [[ -n "$d" && "$d" != "null" ]] && sni_list+=" ${d}"
-  done < <(echo "$config" | jq -c '.services[]?')
-
-  # 构建 SNI 正则，兼容 caddy-l4 inline 语法（block 不被支持）
-  local sni_regex=""
-  for domain in ${sni_list}; do
-    [[ -z "${domain}" ]] && continue
-    local escaped="${domain//./\\.}"
-    if [[ -z "${sni_regex}" ]]; then
-      sni_regex="^(${escaped}"
-    else
-      sni_regex="${sni_regex}|${escaped}"
+    if [[ -n "$d" && "$d" != "null" ]]; then
+      if [[ -z "${sni_list}" ]]; then
+        sni_list="${d}"
+      else
+        sni_list+=" ${d}"
+      fi
     fi
-  done
-  [[ -n "${sni_regex}" ]] && sni_regex="${sni_regex})"
+  done < <(echo "$config" | jq -c '.services[]?')
 
   {
     echo "# _naive_config_begin_"
     echo "{"
     echo "  order forward_proxy first"
-    echo "}"
 
-    if [[ "${transit_enabled}" == "true" && -n "${sni_regex}" ]]; then
-      echo "layer4 :443 {"
-      echo "  @local tls sni_regexp ${sni_regex}"
-      echo "  route @local {"
-      echo "    proxy localhost:${naive_port}"
+    if [[ "${transit_enabled}" == "true" && -n "${sni_list}" ]]; then
+      echo "  layer4 {"
+      echo "    :443 {"
+      echo "      @local tls sni ${sni_list}"
+      echo "      route @local {"
+      echo "        proxy localhost:8443"
+      echo "      }"
+      echo "      route {"
+      echo "        proxy ${transit_ip}:${transit_port}"
+      echo "      }"
+      echo "    }"
+      echo "    :80 {"
+      echo "      route {"
+      echo "        proxy ${transit_ip}:80"
+      echo "      }"
+      echo "    }"
       echo "  }"
-      echo "  route {"
-      echo "    proxy ${transit_ip}:${transit_port}"
-      echo "  }"
-      echo "}"
-      echo "layer4 :80 {"
-      echo "  route {"
-      echo "    proxy ${transit_ip}:80"
-      echo "  }"
-      echo "}"
     fi
 
-    echo ":${naive_port}, ${naive_domain}:${naive_port} {"
+    echo "}"
+
+    if [[ "${transit_enabled}" == "true" ]]; then
+      echo ":8443, ${naive_domain}:8443 {"
+      echo "  bind 127.0.0.1"
+    else
+      echo ":${naive_port}, ${naive_domain}:${naive_port} {"
+    fi
     if [[ -n "${cf_key}" && "${cf_key}" != "null" ]]; then
       echo "  tls {"
       echo "    dns cloudflare ${cf_key}"
@@ -402,8 +501,8 @@ generate_caddyfile() {
     echo "    probe_resistance"
     while IFS= read -r user; do
       local u p
-      u=$(echo "$user" | jq -r '.name')
-      p=$(echo "$user" | jq -r '.password')
+      u=$(echo "$user" | jq -r '.name' | tr -d '[:space:]')
+      p=$(echo "$user" | jq -r '.password' | tr -d '[:space:]')
       [[ -n "$u" && -n "$p" ]] && echo "    basic_auth ${u} ${p}"
     done < <(echo "$config" | jq -c '.users[]?')
     echo "  }"
@@ -463,6 +562,7 @@ generate_caddyfile() {
       _red "caddy validate 失败，原配置未改动"
       _yellow "validate 输出 (临时文件 ${validate_log}):"
       cat "${validate_log}" >&2
+      _yellow "已改用 tls sni 列表语法，如仍提示 layer4 相关错误，请确认域名列表合法且当前 caddy 已含 caddy-l4 模块 (caddy list-modules | grep layer4)"
       if [[ -n "${cp_err}" ]]; then
         _red "保存失败文件到 ${failed_copy} 失败: ${cp_err}"
       else
@@ -478,11 +578,18 @@ generate_caddyfile() {
     cp "${CADDYFILE}" "/etc/caddy/Caddyfile.bak_$(date +%Y%m%d%H%M%S)"
   fi
   mv "${tmp_final}" "${CADDYFILE}"
+  # 确保目录与文件权限/属主，避免 caddy 无法读取
+  install -d -m 755 "/etc/caddy"
+  chown root:caddy "${CADDYFILE}" || true
+  chmod 640 "${CADDYFILE}" || true
   [[ -n "${tmp_block:-}" ]] && rm -f "${tmp_block}"
   [[ -n "${tmp_clean:-}" ]] && rm -f "${tmp_clean}"
   [[ -n "${tmp_final:-}" ]] && rm -f "${tmp_final}"
   return 0
 }
+
+# 确保 /etc/caddy 目录权限
+install -d -m 755 "/etc/caddy"
 
 restart_caddy() {
   service caddy restart || service caddy start
@@ -530,7 +637,11 @@ print_naive_urls() {
     p=$(echo "$user" | jq -r '.password')
     [[ -z "$u" || -z "$p" ]] && continue
     url="https://$(echo -n "${u}:${p}@${naive_domain}:${naive_port}" | base64 -w 0)"
+    echo
+    _cyan "Naive 用户: ${u}"
+    _yellow "URL:"
     echo "${url}" | tee -a "${output_file}"
+    _yellow "二维码 (用户 ${u}):"
     qrencode -t UTF8 "${url}" | tee -a "${output_file}"
   done < <(echo "$config" | jq -c '.users[]?')
 }
@@ -560,7 +671,7 @@ collect_initial_config() {
     userpass=$(prompt_user_pwd)
     local uname="${userpass%%:*}" pwd="${userpass##*:}"
     config=$(echo "$config" | jq --arg u "$uname" --arg p "$pwd" '.users += [{"name":$u,"password":$p}]')
-    ans=$(prompt_yes_no "是否继续添加用户" "N")
+    ans=$(prompt_yes_no "是否继续添加用户" "N" 0 true)
     [[ "$ans" == "N" ]] && break
   done
 
@@ -606,6 +717,16 @@ collect_initial_config() {
 # ===============================
 # 菜单操作
 # ===============================
+post_config_change_prompt() {
+  local ans
+  ans=$(prompt_yes_no "本地配置已更新，是否同步生成 Caddyfile 并重启？" "Y")
+  if [[ "$ans" == "Y" ]]; then
+    menu_regen
+  else
+    _yellow "如需生效，请稍后执行菜单 8 重新生成并重启"
+  fi
+}
+
 menu_transit() {
   local ans ip p
   ans=$(prompt_yes_no "是否启用中转" $( [[ $(cfg_get '.transit.enabled') == "true" ]] && echo "Y" || echo "N" ))
@@ -618,6 +739,7 @@ menu_transit() {
     cfg_set '.transit.enabled=false'
   fi
   save_config
+  post_config_change_prompt
 }
 
 menu_services() {
@@ -634,6 +756,7 @@ menu_services() {
         p=$(prompt_port 3000)
         config=$(echo "$config" | jq --arg n "$n" --arg d "$d" --argjson p "$p" '.services += [{"name":$n,"domain":$d,"local_port":$p}]')
         save_config
+        post_config_change_prompt
         ;;
       2)
         read -rp "输入要修改的业务名称: " n
@@ -642,6 +765,7 @@ menu_services() {
           p=$(prompt_port 3000)
           config=$(echo "$config" | jq --arg n "$n" --arg d "$d" --argjson p "$p" '(.services[] | select(.name==$n) | .domain)=$d | (.services[] | select(.name==$n) | .local_port)=$p')
           save_config
+          post_config_change_prompt
         else
           _red "未找到该业务"
         fi
@@ -650,6 +774,7 @@ menu_services() {
         read -rp "输入要删除的业务名称: " n
         config=$(echo "$config" | jq --arg n "$n" ' .services |= map(select(.name!=$n))')
         save_config
+        post_config_change_prompt
         ;;
       4) break ;;
       *) error ;;
@@ -661,6 +786,7 @@ menu_cfkey() {
   read -rp "请输入新的 Cloudflare API Key(可空): " cf
   cfg_set ".cloudflare_key=\"${cf}\""
   save_config
+  post_config_change_prompt
 }
 
 menu_users() {
@@ -675,6 +801,7 @@ menu_users() {
         up=$(prompt_user_pwd); u=${up%%:*}; p=${up##*:}
         config=$(echo "$config" | jq --arg u "$u" --arg p "$p" '.users += [{"name":$u,"password":$p}]')
         save_config
+        post_config_change_prompt
         ;;
       2)
         read -rp "要修改的用户名: " u
@@ -682,6 +809,7 @@ menu_users() {
           read -rp "新密码: " p
           config=$(echo "$config" | jq --arg u "$u" --arg p "$p" '(.users[] | select(.name==$u) | .password)=$p')
           save_config
+          post_config_change_prompt
         else
           _red "未找到用户"
         fi
@@ -690,6 +818,7 @@ menu_users() {
         read -rp "要删除的用户名: " u
         config=$(echo "$config" | jq --arg u "$u" '.users |= map(select(.name!=$u))')
         save_config
+        post_config_change_prompt
         ;;
       4) break ;;
       *) error ;;
@@ -703,6 +832,7 @@ menu_domain_port() {
   p=$(prompt_port $(cfg_get '.naive_port'))
   cfg_set ".naive_domain=\"${d}\" | .naive_port=${p}"
   save_config
+  post_config_change_prompt
 }
 
 menu_mode() {
@@ -715,6 +845,7 @@ menu_mode() {
     *) error ; return ;;
   esac
   save_config
+  post_config_change_prompt
 }
 
 menu_regen() {
@@ -726,29 +857,258 @@ menu_regen() {
   fi
 }
 
+menu_print_naive_urls() {
+  load_config
+  local naive_domain naive_port users_count
+  naive_domain=$(cfg_get '.naive_domain')
+  naive_port=$(cfg_get '.naive_port')
+  users_count=$(echo "$config" | jq '(.users // []) | length')
+
+  if [[ -z "$naive_domain" || "$naive_domain" == "null" || -z "$naive_port" || "$naive_port" == "null" ]]; then
+    _red "当前未完成初始化，请先配置域名与端口"
+    return
+  fi
+
+  if [[ "$users_count" -eq 0 ]]; then
+    _red "当前未配置 Naive 用户，请先添加用户"
+    return
+  fi
+
+  print_naive_urls
+}
+
 menu_update_caddy() {
-  ensure_transit_build_source
+  # 展示本地/最新版本信息
+  local local_info latest_tag
+  local_info=$(get_local_caddy_info)
+  latest_tag=$(fetch_latest_naive_tag)
+
+  _cyan "本地 Caddy: ${local_info}"
+  _cyan "线上最新：预编译 ${latest_tag}"
+
+  ensure_transit_build_source || true
   local source=$(cfg_get '.caddy_source')
-  echo "当前来源: ${source}"
   if [[ $(cfg_get '.transit.enabled') == "true" ]]; then
-    _yellow "中转已启用：预编译 Caddy 不含 caddy-l4，已锁定自编译"
+    _yellow "已启用中转：只能自编译（需要 caddy-l4 + naive 模块）"
+    if [[ "${LAST_CADDY_MODULE_STATUS:-未检测}" != "已包含naive和caddy-l4插件" ]]; then
+      _yellow "预编译缺少所需模块caddy-l4，启用中转必须自编译"
+    fi
+    local confirm
+    confirm=$(prompt_yes_no "是否继续自编译更新 Caddy" "Y")
+    [[ "${confirm}" == "N" ]] && { _yellow "已取消更新"; return; }
     source="build"
   else
-    echo "1) 预编译（原 naive 作者版本，不支持中转）  2) 重编译（包含 caddy-l4 支持中转）"
-    read -rp "选择: " op
+    if [[ "${LAST_CADDY_MODULE_STATUS:-未检测}" != "已包含naive和caddy-l4插件" ]]; then
+      _yellow "预编译缺少所需模块caddy-l4，启用中转必须自编译"
+    fi
+
+    echo "请选择更新来源："
+    echo "1) 预编译（原 naive 作者版本，不含 caddy-l4）"
+    echo "2) 自编译（包含 forwardproxy@naive + caddy-l4，可支持中转）"
+    read -rp "选择 [1-2]: " op
     case "$op" in
       1) source="prebuilt" ;;
       2) source="build" ;;
       *) error; return ;;
     esac
   fi
+
+  _yellow "将覆盖现有 caddy 可执行文件 (source=${source})"
+
   cfg_set ".caddy_source=\"${source}\""
+  if [[ "${source}" == "build" ]]; then
+    cfg_set ".caddy_version=\"${DEFAULT_SELF_BUILT_VERSION}\""
+  fi
   save_config
+
   if ! install_or_update_caddy "${source}"; then
     _red "更新 Caddy 失败（见上方日志）"
+    _yellow "Caddy 更新未完成，将返回菜单"
+    pause
     return 1
   fi
+
+  # 自编译成功后，将线上最新 tag 写入配置作为本地版本号；预编译则写实际下载 tag
+  if [[ "${source}" == "build" ]]; then
+    cfg_set ".caddy_version=\"$(fetch_latest_naive_tag)\""
+  else
+    cfg_set ".caddy_version=\"$(fetch_latest_naive_tag)\""
+  fi
+  save_config
+
   restart_caddy
+}
+
+menu_reset_init() {
+  echo "选择重置方式："
+  echo "A) 更名备份后重置"
+  echo "B) 直接删除旧配置后重置"
+  echo "C) 取消返回"
+
+  local choice="" ts="" caddy_has_marker="yes"
+  while :; do
+    read -rp "请选择 [A/B/C]: " choice
+    case "${choice}" in
+      [aA]) choice="A"; break ;;
+      [bB]) choice="B"; break ;;
+      [cC]) choice="C"; break ;;
+      *) error ;;
+    esac
+  done
+
+  if [[ "${choice}" == "C" ]]; then
+    _yellow "已取消重置"
+    return
+  fi
+
+  ts=$(date +%Y%m%d%H%M%S)
+
+  backup_if_exists() {
+    local file="$1" suffix="$2"
+    if [[ -f "${file}" ]]; then
+      mv "${file}" "${file}.${suffix}_${ts}"
+      _yellow "已备份 ${file} -> ${file}.${suffix}_${ts}"
+    fi
+  }
+
+  delete_if_exists() {
+    local file="$1"
+    if [[ -f "${file}" ]]; then
+      rm -f "${file}"
+      _yellow "已删除 ${file}"
+    fi
+  }
+
+  if [[ -f "${CADDYFILE}" ]]; then
+    if ! grep -q "_naive_config_begin_" "${CADDYFILE}"; then
+      caddy_has_marker="no"
+    fi
+  fi
+
+  case "${choice}" in
+    A)
+      backup_if_exists "${CONFIG_PATH}" "bak"
+      backup_if_exists "${CADDYFILE}" "bak"
+      ;;
+    B)
+      if [[ "${caddy_has_marker}" == "no" ]]; then
+        local confirm_del
+        confirm_del=$(prompt_yes_no "检测到现有 Caddyfile 无标记块，删除将丢失自定义，确认删除吗" "N")
+        if [[ "${confirm_del}" != "Y" ]]; then
+          _yellow "已取消删除"
+          return
+        fi
+      fi
+      delete_if_exists "${CONFIG_PATH}"
+      delete_if_exists "${CADDYFILE}"
+      ;;
+  esac
+
+  config="${DEFAULT_CONFIG}"
+
+  _yellow "开始重新采集初始化配置"
+  collect_initial_config
+  prepare_xkcd
+  if ensure_transit_build_source; then
+    save_config
+  fi
+  if ! install_or_update_caddy "$(cfg_get '.caddy_source')"; then
+    _red "安装/更新 Caddy 失败，重置中止"
+    return 1
+  fi
+  if generate_caddyfile; then
+    restart_caddy
+    print_naive_urls
+  else
+    _red "生成 Caddyfile 失败，已保留失败文件 (见上方日志)"
+    return 1
+  fi
+}
+
+menu_reset_init() {
+  echo "选择重置方式："
+  echo "A) 更名备份后重置"
+  echo "B) 直接删除旧配置后重置"
+  echo "C) 取消返回"
+
+  local choice="" ts="" caddy_has_marker="yes"
+  while :; do
+    read -rp "请选择 [A/B/C]: " choice
+    case "${choice}" in
+      [aA]) choice="A"; break ;;
+      [bB]) choice="B"; break ;;
+      [cC]) choice="C"; break ;;
+      *) error ;;
+    esac
+  done
+
+  if [[ "${choice}" == "C" ]]; then
+    _yellow "已取消重置"
+    return
+  fi
+
+  ts=$(date +%Y%m%d%H%M%S)
+
+  backup_if_exists() {
+    local file="$1" suffix="$2"
+    if [[ -f "${file}" ]]; then
+      mv "${file}" "${file}.${suffix}_${ts}"
+      _yellow "已备份 ${file} -> ${file}.${suffix}_${ts}"
+    fi
+  }
+
+  delete_if_exists() {
+    local file="$1"
+    if [[ -f "${file}" ]]; then
+      rm -f "${file}"
+      _yellow "已删除 ${file}"
+    fi
+  }
+
+  if [[ -f "${CADDYFILE}" ]]; then
+    if ! grep -q "_naive_config_begin_" "${CADDYFILE}"; then
+      caddy_has_marker="no"
+    fi
+  fi
+
+  case "${choice}" in
+    A)
+      backup_if_exists "${CONFIG_PATH}" "bak"
+      backup_if_exists "${CADDYFILE}" "bak"
+      ;;
+    B)
+      if [[ "${caddy_has_marker}" == "no" ]]; then
+        local confirm_del
+        confirm_del=$(prompt_yes_no "检测到现有 Caddyfile 无标记块，删除将丢失自定义，确认删除吗" "N")
+        if [[ "${confirm_del}" != "Y" ]]; then
+          _yellow "已取消删除"
+          return
+        fi
+      fi
+      delete_if_exists "${CONFIG_PATH}"
+      delete_if_exists "${CADDYFILE}"
+      ;;
+  esac
+
+  config="${DEFAULT_CONFIG}"
+
+  _yellow "开始重新采集初始化配置"
+  collect_initial_config
+  prepare_xkcd
+  if ensure_transit_build_source; then
+    save_config
+  fi
+  if ! install_or_update_caddy "$(cfg_get '.caddy_source')"; then
+    _red "安装/更新 Caddy 失败，重置中止"
+    return 1
+  fi
+  if generate_caddyfile; then
+    restart_caddy
+    print_naive_urls
+  else
+    _red "生成 Caddyfile 失败，已保留失败文件 (见上方日志)"
+    return 1
+  fi
 }
 
 menu_loop() {
@@ -763,7 +1123,9 @@ menu_loop() {
     echo "7) 切换 file_server/反代"
     echo "8) 重新生成 Caddyfile 并重启"
     echo "9) 更新 Caddy (预编译/重编译)"
-    echo "10) 退出"
+    echo "10) 重新开始初始化（备份/删除现有配置）"
+    echo "11) 查看当前 Naive URL/二维码"
+    echo "12) 退出"
     read -rp "选择: " op
     case "$op" in
       1) show_summary ;;
@@ -775,7 +1137,9 @@ menu_loop() {
       7) menu_mode ;;
       8) menu_regen ;;
       9) menu_update_caddy ;;
-      10) break ;;
+      10) menu_reset_init ;;
+      11) menu_print_naive_urls ;;
+      12) break ;;
       *) error ;;
     esac
   done
