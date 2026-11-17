@@ -245,12 +245,12 @@ prompt_yes_no() {
   # 规范默认提示：默认是 Y 则 "Y/n"，默认是 N 则 "y/N"
   local suffix_default="Y/n"
   [[ "${default_ans}" == "N" ]] && suffix_default="y/N"
-  [[ "${newline_before}" == "true" ]] && echo
+  [[ "${newline_before}" == "true" ]] && echo >&2
   while :; do
     if [[ "${timeout}" -gt 0 ]]; then
       if ! read -rt "${timeout}" -rp "${prompt} (${suffix_default}, 默认${default_ans}, ${timeout}s 超时默认): " ans; then
         ans="${default_ans}"
-        echo
+        echo >&2
       fi
     else
       read -rp "${prompt} (${suffix_default}, 默认${default_ans}): " ans
@@ -259,7 +259,7 @@ prompt_yes_no() {
     case "$ans" in
       [yY]) echo "Y"; return ;;
       [nN]) echo "N"; return ;;
-      *) error ;;
+      *) error >&2 ;;
     esac
   done
 }
